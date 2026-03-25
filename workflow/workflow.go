@@ -127,10 +127,11 @@ func Run() error {
 	// --- Step 6: Place order (with retry) ---
 	//
 	// SALE_CLOSED = the store's sale window hasn't opened yet (or closed).
-	//   -> poll every 500ms for up to 2 minutes to catch the exact opening.
+	//   -> poll every 100ms for up to 2 minutes to catch the exact opening.
+	// SOLD_OUT = no stock left — fail immediately, no point retrying.
 	// Other errors -> retry up to 5 times with 2s gaps.
 	const saleClosedTimeout = 2 * time.Minute
-	const saleClosedPollInterval = 500 * time.Millisecond
+	const saleClosedPollInterval = 100 * time.Millisecond
 	const maxOtherRetries = 5
 	const otherRetryInterval = 2 * time.Second
 
@@ -148,18 +149,23 @@ func Run() error {
 		}
 
 		var oe *tgtg.OrderError
-		if errors.As(err, &oe) && oe.State == "SALE_CLOSED" {
-			if time.Now().Before(deadline) {
-				if attempt == 1 {
-					fmt.Printf("[-] Sale not open yet — polling every %v (timeout %v)...\n", saleClosedPollInterval, saleClosedTimeout)
+		if errors.As(err, &oe) {
+			switch oe.State {
+			case "SALE_CLOSED":
+				if time.Now().Before(deadline) {
+					if attempt == 1 {
+						fmt.Printf("[-] Sale not open yet — polling every %v (timeout %v)...\n", saleClosedPollInterval, saleClosedTimeout)
+					}
+					if attempt%100 == 0 {
+						fmt.Printf("    still waiting... (%d attempts, %s remaining)\n", attempt, time.Until(deadline).Round(time.Second))
+					}
+					time.Sleep(saleClosedPollInterval)
+					continue
 				}
-				if attempt%20 == 0 {
-					fmt.Printf("    still waiting... (%d attempts, %s remaining)\n", attempt, time.Until(deadline).Round(time.Second))
-				}
-				time.Sleep(saleClosedPollInterval)
-				continue
+				return fmt.Errorf("sale did not open within %v — gave up after %d attempts", saleClosedTimeout, attempt)
+			case "SOLD_OUT":
+				return fmt.Errorf("item is sold out — no stock available")
 			}
-			return fmt.Errorf("sale did not open within %v — gave up after %d attempts", saleClosedTimeout, attempt)
 		}
 
 		otherFailures++
