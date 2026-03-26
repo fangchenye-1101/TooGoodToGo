@@ -213,6 +213,44 @@ func (c *Client) GetFavorites() ([]FavoriteItem, error) {
 	return all, nil
 }
 
+// GetItemStock returns the current items_available count for a single item.
+// This is a lightweight read-only query suitable for high-frequency polling.
+func (c *Client) GetItemStock(itemID string) (int, error) {
+	if err := c.ensureAuth(); err != nil {
+		return 0, err
+	}
+
+	req := GetItemsRequest{
+		UserID:         c.Credentials.UserID,
+		Origin:         Origin{Latitude: 0, Longitude: 0},
+		Radius:         21,
+		PageSize:       1,
+		Page:           1,
+		Discover:       false,
+		FavoritesOnly:  true,
+		ItemCategories: []string{},
+		DietCategories: []string{},
+		WithStockOnly:  false,
+		HiddenOnly:     false,
+		WeCareOnly:     false,
+	}
+	_, body, err := c.Session.Post(itemEndpoint, req, c.Credentials.AccessToken)
+	if err != nil {
+		return 0, fmt.Errorf("get item stock: %w", err)
+	}
+
+	var ir ItemsResponse
+	if err := json.Unmarshal(body, &ir); err != nil {
+		return 0, fmt.Errorf("parse item stock response: %w", err)
+	}
+	for _, item := range ir.Items {
+		if item.Item.ItemID == itemID {
+			return item.ItemsAvailable, nil
+		}
+	}
+	return 0, nil
+}
+
 // ---------------------------------------------------------------------------
 // Orders
 // ---------------------------------------------------------------------------

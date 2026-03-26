@@ -32,6 +32,17 @@ const (
 
 var datadomeValueRe = regexp.MustCompile(`datadome=([^;]+)`)
 
+// DataDomeError is returned when the API responds with 403, indicating
+// DataDome anti-bot detection. Callers can check for this to decide how
+// long to wait before retrying.
+type DataDomeError struct {
+	Attempt int
+}
+
+func (e *DataDomeError) Error() string {
+	return fmt.Sprintf("DataDome 403 (attempt %d)", e.Attempt)
+}
+
 // Session wraps http.Client with TGTG-specific behaviour:
 // DataDome cookie management, rate-limiting, and 403 retry.
 type Session struct {
@@ -118,9 +129,7 @@ func (s *Session) doPost(fullURL string, body any, accessToken string) (*http.Re
 	}
 
 	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted {
-		s.mu.Lock()
-		s.captchaErrCnt = 0
-		s.mu.Unlock()
+		s.ResetCaptchaCount()
 		return resp, respBody, nil
 	}
 
@@ -135,12 +144,20 @@ func (s *Session) handle403(fullURL string, body any, accessToken string) (*http
 	s.mu.Lock()
 	s.captchaErrCnt++
 	cnt := s.captchaErrCnt
+	burst := s.burstMode
 	s.mu.Unlock()
 
-	log.Printf("[TGTG] 403 Captcha error (attempt %d)", cnt)
+	log.Printf("[TGTG] 403 DataDome block (consecutive: %d, burst=%v)", cnt, burst)
 	s.invalidateDataDome()
 	s.RotateUserAgent()
 
+	// In burst mode (snipe phase), return error to let the caller control
+	// retry timing so it doesn't waste the critical window on backoff.
+	if burst {
+		return nil, nil, &DataDomeError{Attempt: cnt}
+	}
+
+	// Normal mode: retry automatically with backoff.
 	if cnt >= MaxCaptchaErr {
 		log.Printf("[TGTG] Too many 403s, sleeping 10 minutes...")
 		time.Sleep(10 * time.Minute)
@@ -157,6 +174,13 @@ func (s *Session) handle403(fullURL string, body any, accessToken string) (*http
 	time.Sleep(backoff)
 
 	return s.doPost(fullURL, body, accessToken)
+}
+
+// ResetCaptchaCount resets the consecutive 403 counter after a successful request.
+func (s *Session) ResetCaptchaCount() {
+	s.mu.Lock()
+	s.captchaErrCnt = 0
+	s.mu.Unlock()
 }
 
 func (s *Session) Get(rawURL string) (*http.Response, []byte, error) {

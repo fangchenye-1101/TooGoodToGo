@@ -124,58 +124,96 @@ func Run() error {
 		defer client.Session.SetBurstMode(false)
 	}
 
-	// --- Step 6: Place order (with retry) ---
+	// --- Step 6: Place order (two-phase snipe) ---
 	//
-	// SALE_CLOSED = the store's sale window hasn't opened yet (or closed).
-	//   -> poll every 100ms for up to 2 minutes to catch the exact opening.
-	// SOLD_OUT = no stock left — fail immediately, no point retrying.
-	// Other errors -> retry up to 5 times with 2s gaps.
-	const saleClosedTimeout = 2 * time.Minute
-	const saleClosedPollInterval = 100 * time.Millisecond
-	const maxOtherRetries = 5
-	const otherRetryInterval = 2 * time.Second
+	// Phase 1 — Stock detection: poll GetItemStock every 2s (lightweight
+	//   read-only endpoint, unlikely to trigger DataDome). Wait until
+	//   items_available > 0.
+	// Phase 2 — Instant lock: fire CreateOrder immediately. If SALE_CLOSED
+	//   (tiny race), retry up to 5× at 500ms. If SOLD_OUT, fail.
+	const stockPollTimeout = 5 * time.Minute
+	const stockPollInterval = 2 * time.Second
+	const dataDomeBackoff = 5 * time.Second
+	const lockMaxRetries = 5
+	const lockRetryInterval = 500 * time.Millisecond
 
+	itemID := selected.Item.ItemID
 	var order *tgtg.Order
-	fmt.Println("\n[*] Placing order...")
 
-	deadline := time.Now().Add(saleClosedTimeout)
-	otherFailures := 0
-	attempt := 0
-	for {
-		attempt++
-		order, err = client.CreateOrder(selected.Item.ItemID, 1)
+	// ---- Phase 1: wait for stock ----
+	fmt.Println("\n[*] Phase 1: Watching for stock...")
+	stockDeadline := time.Now().Add(stockPollTimeout)
+	poll := 0
+	for time.Now().Before(stockDeadline) {
+		poll++
+		stock, err := client.GetItemStock(itemID)
+		if err != nil {
+			var dde *tgtg.DataDomeError
+			if errors.As(err, &dde) {
+				fmt.Printf("[-] DataDome 403 during stock check (hit %d) — waiting %v...\n", dde.Attempt, dataDomeBackoff)
+				time.Sleep(dataDomeBackoff)
+				continue
+			}
+			fmt.Printf("[-] Stock check error: %v — retrying...\n", err)
+			time.Sleep(stockPollInterval)
+			continue
+		}
+
+		if stock > 0 {
+			fmt.Printf("[+] Stock detected! (%d available) — locking order NOW\n", stock)
+			goto lockOrder
+		}
+
+		if poll == 1 {
+			fmt.Printf("    No stock yet — polling every %v (timeout %v)...\n", stockPollInterval, stockPollTimeout)
+		}
+		if poll%30 == 0 {
+			fmt.Printf("    still watching... (%d checks, %s remaining)\n", poll, time.Until(stockDeadline).Round(time.Second))
+		}
+		time.Sleep(stockPollInterval)
+	}
+	return fmt.Errorf("no stock appeared within %v — gave up after %d checks", stockPollTimeout, poll)
+
+lockOrder:
+	// ---- Phase 2: instant lock ----
+	fmt.Println("[*] Phase 2: Locking order...")
+	for attempt := 1; attempt <= lockMaxRetries; attempt++ {
+		order, err = client.CreateOrder(itemID, 1)
 		if err == nil {
 			break
+		}
+
+		var dde *tgtg.DataDomeError
+		if errors.As(err, &dde) {
+			fmt.Printf("[-] DataDome 403 on lock attempt %d — waiting %v...\n", attempt, dataDomeBackoff)
+			time.Sleep(dataDomeBackoff)
+			continue
 		}
 
 		var oe *tgtg.OrderError
 		if errors.As(err, &oe) {
 			switch oe.State {
+			case "SOLD_OUT":
+				return fmt.Errorf("item sold out before we could lock it")
 			case "SALE_CLOSED":
-				if time.Now().Before(deadline) {
-					if attempt == 1 {
-						fmt.Printf("[-] Sale not open yet — polling every %v (timeout %v)...\n", saleClosedPollInterval, saleClosedTimeout)
-					}
-					if attempt%100 == 0 {
-						fmt.Printf("    still waiting... (%d attempts, %s remaining)\n", attempt, time.Until(deadline).Round(time.Second))
-					}
-					time.Sleep(saleClosedPollInterval)
+				if attempt < lockMaxRetries {
+					fmt.Printf("[-] SALE_CLOSED on attempt %d — retrying in %v...\n", attempt, lockRetryInterval)
+					time.Sleep(lockRetryInterval)
 					continue
 				}
-				return fmt.Errorf("sale did not open within %v — gave up after %d attempts", saleClosedTimeout, attempt)
-			case "SOLD_OUT":
-				return fmt.Errorf("item is sold out — no stock available")
 			}
 		}
 
-		otherFailures++
-		if otherFailures >= maxOtherRetries {
-			return fmt.Errorf("order creation failed after %d non-SALE_CLOSED attempts: %w", otherFailures, err)
+		if attempt == lockMaxRetries {
+			return fmt.Errorf("failed to lock order after %d attempts: %w", lockMaxRetries, err)
 		}
-		fmt.Printf("[-] Order attempt %d failed: %v — retrying in %s...\n", attempt, err, otherRetryInterval)
-		time.Sleep(otherRetryInterval)
+		fmt.Printf("[-] Lock attempt %d failed: %v — retrying in %v...\n", attempt, err, lockRetryInterval)
+		time.Sleep(lockRetryInterval)
 	}
-	fmt.Printf("[+] Order created! ID: %s\n", order.ID)
+	if order == nil {
+		return fmt.Errorf("failed to lock order after %d attempts: %w", lockMaxRetries, err)
+	}
+	fmt.Printf("[+] Order locked! ID: %s\n", order.ID)
 
 	// --- Step 7: Pay (with retry) ---
 	const maxPayRetries = 3
